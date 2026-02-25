@@ -12,14 +12,15 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 
-@register("astrbot_plugin_arknights_authorization", "codex", "明日方舟通行证盲盒互动插件", "1.4.4")
+@register("astrbot_plugin_arknights_authorization", "codex", "明日方舟通行证盲盒互动插件", "1.4.6")
 class ArknightsBlindBoxPlugin(Star):
     """明日方舟通行证盲盒互动插件。"""
 
     GUIDE_CANDIDATES = ["selection.jpg", "selection.png", "cover.jpg", "cover.png"]
 
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config=None):
         super().__init__(context)
+        self.config = config
         self.base_dir = Path(__file__).resolve().parent
         self.legacy_data_dir = self.base_dir / "data"
         self.data_dir = self._resolve_persistent_data_dir()
@@ -134,7 +135,7 @@ class ArknightsBlindBoxPlugin(Star):
 
             if not remain_items or not remain_slots:
                 yield event.plain_result(
-                    f"你已选择【{category['name']}】\n"
+                    f"你已选择【{category['id']}】\n"
                     f"当前卡池剩余：{len(remain_items)}\n"
                     f"当前可选序号数：{len(remain_slots)}/{category['slot_total']}\n"
                     f"当前单抽价格：{price} 元\n"
@@ -145,7 +146,7 @@ class ArknightsBlindBoxPlugin(Star):
                 return
 
             tip = (
-                f"你已选择【{category['name']}】\n"
+                f"你已选择【{category['id']}】\n"
                 f"当前卡池剩余：{len(remain_items)}\n"
                 f"当前可选序号数：{len(remain_slots)}/{category['slot_total']}\n"
                 f"当前单抽价格：{price} 元\n"
@@ -174,7 +175,7 @@ class ArknightsBlindBoxPlugin(Star):
 
             remain_items, remain_slots = self._db_get_category_state(category_id)
             if not remain_items or not remain_slots:
-                yield event.plain_result(f"【{category['name']}】卡池或序号已耗尽，请发送：/方舟盲盒 刷新 {category_id}")
+                yield event.plain_result(f"【{category['id']}】卡池或序号已耗尽，请发送：/方舟盲盒 刷新 {category_id}")
                 return
             if choose_slot not in remain_slots:
                 yield event.plain_result(f"序号 {choose_slot} 已不可用，可选序号：{self._format_slots(remain_slots)}")
@@ -199,7 +200,7 @@ class ArknightsBlindBoxPlugin(Star):
             prize_image = item.get("image")
             msg = (
                 f"你选择了第 {choose_slot} 号盲盒，开启结果：\n"
-                f"所属种类：{category['name']}\n"
+                f"所属种类：{category['id']}\n"
                 f"奖品名称：{item['name']}\n"
                 f"当前卡池剩余：{len(remain_items)}\n"
                 f"当前可选序号数：{len(remain_slots)}/{category['slot_total']}\n"
@@ -219,7 +220,7 @@ class ArknightsBlindBoxPlugin(Star):
             self._db_reset_category_state(category_id, self.categories[category_id])
             remain_items, remain_slots = self._db_get_category_state(category_id)
             yield event.plain_result(
-                f"【{self.categories[category_id]['name']}】已刷新。\n"
+                f"【{self.categories[category_id]['id']}】已刷新。\n"
                 f"卡池剩余：{len(remain_items)}\n"
                 f"可选序号：{self._format_slots(remain_slots)}"
             )
@@ -236,7 +237,7 @@ class ArknightsBlindBoxPlugin(Star):
             remain_items, remain_slots = self._db_get_category_state(category_id)
             category = self.categories[category_id]
             yield event.plain_result(
-                f"【{category['name']}】\n"
+                f"【{category['id']}】\n"
                 f"卡池状态：{len(remain_items)}/{len(category['items'])}\n"
                 f"序号状态：{len(remain_slots)}/{category['slot_total']}\n"
                 f"单抽价格：{self._get_category_price(category_id)} 元\n"
@@ -339,7 +340,7 @@ class ArknightsBlindBoxPlugin(Star):
         for category_id, category in self.categories.items():
             remain_items, remain_slots = self._db_get_category_state(category_id)
             lines.append(
-                f"- {category_id}: {category['name']}（类型: {category['box_type']}，价格: {self._get_category_price(category_id)} 元，"
+                f"- {category_id}（类型: {category['box_type']}，价格: {self._get_category_price(category_id)} 元，"
                 f"卡池: {len(remain_items)}/{len(category['items'])}，序号: {len(remain_slots)}/{category['slot_total']}）"
             )
         lines.append("\n使用：/方舟盲盒 选择 <种类ID>")
@@ -452,14 +453,28 @@ class ArknightsBlindBoxPlugin(Star):
         self._last_context_sync = now
 
         conf = None
-        for getter_name in ("get_config", "get_plugin_config", "get_star_config"):
-            getter = getattr(self.context, getter_name, None)
-            if callable(getter):
+
+        # 优先读取 AstrBot 通过 __init__ 注入的插件配置（_conf_schema.json）
+        if self.config:
+            if isinstance(self.config, dict):
+                conf = dict(self.config)
+            else:
                 try:
-                    conf = getter()
-                    break
-                except Exception as ex:
-                    logger.warning(f"[arknights_blindbox] 读取 WebUI 配置失败({getter_name})：{ex}")
+                    conf = dict(self.config)
+                except Exception:
+                    conf = None
+
+        # 回退：兼容旧版本/旧加载路径
+        if not isinstance(conf, dict) or not conf:
+            for getter_name in ("get_config", "get_plugin_config", "get_star_config"):
+                getter = getattr(self.context, getter_name, None)
+                if callable(getter):
+                    try:
+                        conf = getter()
+                        break
+                    except Exception as ex:
+                        logger.warning(f"[arknights_blindbox] 读取 WebUI 配置失败({getter_name})：{ex}")
+
         if not isinstance(conf, dict) or not conf:
             return
 
@@ -495,7 +510,6 @@ class ArknightsBlindBoxPlugin(Star):
                     continue
                 result[category_id] = {
                     "id": category_id,
-                    "name": category_id,
                     "box_type": box_type,
                     "guide_image": guide,
                     "items": items,
