@@ -12,7 +12,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 
-@register("astrbot_plugin_arknights_authorization", "codex", "明日方舟通行证盲盒互动插件", "1.4.3")
+@register("astrbot_plugin_arknights_authorization", "codex", "明日方舟通行证盲盒互动插件", "1.4.4")
 class ArknightsBlindBoxPlugin(Star):
     """明日方舟通行证盲盒互动插件。"""
 
@@ -31,7 +31,6 @@ class ArknightsBlindBoxPlugin(Star):
         self.resource_dir = self.base_dir / "resources"
         self.number_box_dir = self.resource_dir / "number_box"
         self.special_box_dir = self.resource_dir / "special_box"
-        self.revealed_dir = self.resource_dir / "revealed_box"
 
         self.sessions: Dict[str, str] = {}
         self.runtime_config: Dict[str, object] = {}
@@ -197,7 +196,7 @@ class ArknightsBlindBoxPlugin(Star):
             self._db_update_balance(group_id, user_id, balance - price)
 
             item = category["items"][selected]
-            prize_image = self._record_revealed_image(item.get("image"), group_id, user_id)
+            prize_image = item.get("image")
             msg = (
                 f"你选择了第 {choose_slot} 号盲盒，开启结果：\n"
                 f"所属种类：{category['name']}\n"
@@ -432,13 +431,6 @@ class ArknightsBlindBoxPlugin(Star):
         slots = sorted(slots)
         return ", ".join(str(v) for v in slots)
 
-    def _record_revealed_image(self, src: Optional[Path], group_id: str, user_id: str) -> Optional[Path]:
-        if not src or not src.exists():
-            return src
-        self.revealed_dir.mkdir(parents=True, exist_ok=True)
-        dst = self.revealed_dir / f"{group_id}_{user_id}_{int(time.time())}_{src.name}"
-        shutil.copy2(src, dst)
-        return dst
 
     def _load_all(self):
         self.sessions = self._load_json(self.session_path, default={})
@@ -587,10 +579,8 @@ class ArknightsBlindBoxPlugin(Star):
         sub_dir_map = {
             "number_box": "number_box",
             "special_box": "special_box",
-            "revealed_box": "revealed_box",
             "数字盒": "number_box",
             "特殊盒": "special_box",
-            "开出盲盒": "revealed_box",
         }
         source_roots = [
             self.legacy_data_dir / "resources",
