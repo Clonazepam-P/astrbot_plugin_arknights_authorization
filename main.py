@@ -1,5 +1,6 @@
 import json
 import random
+import time
 from pathlib import Path
 from typing import Dict, List
 
@@ -8,7 +9,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 
-@register("astrbot_plugin_arknights_authorization", "codex", "明日方舟通行证盲盒互动插件", "1.1.1")
+@register("astrbot_plugin_arknights_authorization", "codex", "明日方舟通行证盲盒互动插件", "1.2.0")
 class ArknightsBlindBoxPlugin(Star):
     """明日方舟通行证盲盒互动插件。"""
 
@@ -20,28 +21,61 @@ class ArknightsBlindBoxPlugin(Star):
         self.state_path = self.data_dir / "pool_state.json"
         self.slot_state_path = self.data_dir / "slot_state.json"
         self.session_path = self.data_dir / "sessions.json"
+        self.wallet_path = self.data_dir / "wallets.json"
+        self.runtime_config_path = self.data_dir / "runtime_config.json"
 
         self.config: Dict[str, dict] = {}
         self.pool_state: Dict[str, List[str]] = {}
         self.slot_state: Dict[str, List[int]] = {}
         self.sessions: Dict[str, str] = {}
+        self.wallets: Dict[str, int] = {}
+        self.runtime_config: Dict[str, object] = {}
+
+        self._runtime_config_mtime: float = 0
+        self._box_config_mtime: float = 0
+        self._last_context_sync: float = 0
 
     async def initialize(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_default_config()
+        self._ensure_default_runtime_config()
         self._load_all()
+        self._sync_runtime_config_from_context()
         self._ensure_states_initialized()
         logger.info("[arknights_blindbox] 插件初始化完成。")
 
     @filter.command("方舟盲盒")
     async def arknights_blindbox(self, event: AstrMessageEvent):
-        """明日方舟通行证盲盒：列表/选择/开启/状态/刷新。"""
+        """明日方舟通行证盲盒：列表/选择/开启/状态/刷新/注册/钱包/管理。"""
+        self._maybe_reload_runtime_data()
+        self._sync_runtime_config_from_context()
+
         args = self._extract_command_args(event.message_str)
         if not args:
             yield event.plain_result(self._build_help_text())
             return
 
         action = args[0].lower()
+
+        if action in {"注册", "signup", "reg"}:
+            user_key = self._build_wallet_key(event)
+            if user_key in self.wallets:
+                yield event.plain_result(f"你已注册，当前余额：{self.wallets[user_key]} 元")
+                return
+            self.wallets[user_key] = int(self.runtime_config.get("initial_balance", 200))
+            self._save_json(self.wallet_path, self.wallets)
+            yield event.plain_result(f"注册成功，初始余额：{self.wallets[user_key]} 元")
+            return
+
+        if action in {"钱包", "balance", "money"}:
+            user_key = self._build_wallet_key(event)
+            balance = self.wallets.get(user_key)
+            if balance is None:
+                yield event.plain_result("你还未注册，请先发送：/方舟盲盒 注册")
+                return
+            yield event.plain_result(f"当前余额：{balance} 元")
+            return
+
         if action in {"列表", "list", "types"}:
             yield event.plain_result(self._build_category_list_text())
             return
@@ -63,12 +97,14 @@ class ArknightsBlindBoxPlugin(Star):
             remain_pool = len(self.pool_state.get(category_id, []))
             remain_slots = len(self.slot_state.get(category_id, []))
             slots = int(category.get("slots", 0))
+            price = self._get_category_price(category_id)
 
             if remain_pool == 0 or remain_slots == 0:
                 yield event.plain_result(
                     f"你已选择【{category.get('name', category_id)}】\n"
                     f"当前卡池剩余：{remain_pool}\n"
                     f"当前可选序号数：{remain_slots}/{slots}\n"
+                    f"当前单抽价格：{price} 元\n"
                     "该种类已不可继续开启。你可以：\n"
                     f"1) /方舟盲盒 刷新 {category_id}\n"
                     "2) /方舟盲盒 列表（换种类）"
@@ -79,6 +115,7 @@ class ArknightsBlindBoxPlugin(Star):
                 f"你已选择【{category.get('name', category_id)}】\n"
                 f"当前卡池剩余：{remain_pool}\n"
                 f"当前可选序号数：{remain_slots}/{slots}\n"
+                f"当前单抽价格：{price} 元\n"
                 f"可选序号：{self._format_available_slots(category_id)}\n"
                 "请发送指令：/方舟盲盒 开 <序号>"
             )
@@ -88,6 +125,12 @@ class ArknightsBlindBoxPlugin(Star):
             return
 
         if action in {"开", "开启", "open"}:
+            user_key = self._build_wallet_key(event)
+            balance = self.wallets.get(user_key)
+            if balance is None:
+                yield event.plain_result("你还未注册，请先发送：/方舟盲盒 注册")
+                return
+
             if len(args) < 2:
                 yield event.plain_result("请提供序号，例如：/方舟盲盒 开 3")
                 return
@@ -112,34 +155,34 @@ class ArknightsBlindBoxPlugin(Star):
                 return
 
             draw_pool = self.pool_state.get(category_id, [])
-            if not draw_pool:
-                yield event.plain_result(
-                    f"【{category.get('name', category_id)}】当前卡池剩余：0\n"
-                    "该种类卡池已空。你可以：\n"
-                    f"1) /方舟盲盒 刷新 {category_id}\n"
-                    "2) /方舟盲盒 列表（换种类）"
-                )
-                return
-
             available_slots = self.slot_state.get(category_id, [])
-            if not available_slots:
+            if not draw_pool or not available_slots:
                 yield event.plain_result(
-                    f"【{category.get('name', category_id)}】当前可选序号为 0。\n"
-                    f"请发送刷新指令：/方舟盲盒 刷新 {category_id}，或切换种类。"
+                    f"【{category.get('name', category_id)}】当前卡池或序号已耗尽。\n"
+                    f"请发送：/方舟盲盒 刷新 {category_id}，或切换种类。"
                 )
                 return
-
             if box_no not in available_slots:
                 yield event.plain_result(
                     f"序号 {box_no} 已被选择，当前可选序号：{self._format_available_slots(category_id)}"
                 )
                 return
 
+            price = self._get_category_price(category_id)
+            if balance < price:
+                yield event.plain_result(
+                    f"余额不足，当前余额：{balance} 元，当前种类单抽价格：{price} 元。"
+                )
+                return
+
             selected_item_id = random.choice(draw_pool)
             draw_pool.remove(selected_item_id)
             available_slots.remove(box_no)
+            self.wallets[user_key] = balance - price
+
             self._save_json(self.state_path, self.pool_state)
             self._save_json(self.slot_state_path, self.slot_state)
+            self._save_json(self.wallet_path, self.wallets)
 
             item = category.get("items", {}).get(selected_item_id, {})
             item_name = item.get("name", selected_item_id)
@@ -147,13 +190,13 @@ class ArknightsBlindBoxPlugin(Star):
 
             remain_pool = len(draw_pool)
             remain_slots = len(available_slots)
-
             msg = (
                 f"你选择了第 {box_no} 号盲盒，开启结果：\n"
                 f"所属种类：{category.get('name', category_id)}\n"
                 f"奖品名称：{item_name}\n"
                 f"当前卡池剩余：{remain_pool}\n"
-                f"当前可选序号数：{remain_slots}/{slots}"
+                f"当前可选序号数：{remain_slots}/{slots}\n"
+                f"本次花费：{price} 元，当前余额：{self.wallets[user_key]} 元"
             )
             for result in self._build_results_with_optional_image(event, msg, item_image):
                 yield result
@@ -167,11 +210,15 @@ class ArknightsBlindBoxPlugin(Star):
             return
 
         if action in {"刷新", "reset", "refresh"}:
-            session_key = self._build_session_key(event)
-            category_id = args[1] if len(args) > 1 else self.sessions.get(session_key)
-            if not category_id:
-                yield event.plain_result("请使用：/方舟盲盒 刷新 <种类ID>，或先选择种类后再刷新。")
-                return
+            if len(args) < 2:
+                session_key = self._build_session_key(event)
+                category_id = self.sessions.get(session_key)
+                if not category_id:
+                    yield event.plain_result("请使用：/方舟盲盒 刷新 <种类ID>，或先选择种类后再刷新。")
+                    return
+            else:
+                category_id = args[1]
+
             if category_id not in self.config:
                 yield event.plain_result(f"不存在种类 `{category_id}`。")
                 return
@@ -186,24 +233,105 @@ class ArknightsBlindBoxPlugin(Star):
             return
 
         if action in {"状态", "status"}:
-            session_key = self._build_session_key(event)
-            category_id = args[1] if len(args) > 1 else self.sessions.get(session_key)
-            if not category_id:
-                yield event.plain_result("请使用：/方舟盲盒 状态 <种类ID> 或先选择种类后再查看状态。")
-                return
+            if len(args) < 2:
+                session_key = self._build_session_key(event)
+                category_id = self.sessions.get(session_key)
+                if not category_id:
+                    yield event.plain_result("请使用：/方舟盲盒 状态 <种类ID> 或先选择种类后再查看状态。")
+                    return
+            else:
+                category_id = args[1]
+
             if category_id not in self.config:
                 yield event.plain_result(f"不存在种类 `{category_id}`。")
                 return
 
             category = self.config[category_id]
+            user_key = self._build_wallet_key(event)
+            balance = self.wallets.get(user_key, "未注册")
             yield event.plain_result(
                 f"【{category.get('name', category_id)}】\n"
                 f"卡池状态：{len(self.pool_state.get(category_id, []))}/{len(category.get('items', {}))}\n"
-                f"序号状态：{len(self.slot_state.get(category_id, []))}/{int(category.get('slots', 0))}"
+                f"序号状态：{len(self.slot_state.get(category_id, []))}/{int(category.get('slots', 0))}\n"
+                f"单抽价格：{self._get_category_price(category_id)} 元\n"
+                f"你的余额：{balance}"
             )
             return
 
+        if action in {"管理员", "admin"}:
+            for result in self._handle_admin_command(event, args[1:]):
+                yield result
+            return
+
+        if action in {"重载配置", "reload"}:
+            if not self._is_admin(event):
+                yield event.plain_result("仅管理员可执行该命令。")
+                return
+            self._load_all()
+            self._ensure_states_initialized()
+            yield event.plain_result("配置与状态已重载。")
+            return
+
         yield event.plain_result(self._build_help_text())
+
+    def _handle_admin_command(self, event: AstrMessageEvent, args: List[str]):
+        if not args:
+            return [event.plain_result("管理员指令：列表/添加 <user_id>/移除 <user_id>/特殊定价 <种类ID> <金额>")]
+
+        action = args[0]
+        current_user = self._build_wallet_key(event)
+        admins = self._get_admin_ids()
+
+        if action == "列表":
+            return [event.plain_result(f"管理员列表：{', '.join(admins) if admins else '暂无'}")]
+
+        if action in {"添加", "add"}:
+            if len(args) < 2:
+                return [event.plain_result("用法：/方舟盲盒 管理员 添加 <user_id>")]
+            target = args[1]
+            if admins and current_user not in admins:
+                return [event.plain_result("仅管理员可添加管理员。")]
+            if target not in admins:
+                admins.append(target)
+                self.runtime_config["admin_ids"] = admins
+                self._save_json(self.runtime_config_path, self.runtime_config)
+            return [event.plain_result(f"已添加管理员：{target}")]
+
+        if action in {"移除", "remove"}:
+            if len(args) < 2:
+                return [event.plain_result("用法：/方舟盲盒 管理员 移除 <user_id>")]
+            target = args[1]
+            if current_user not in admins:
+                return [event.plain_result("仅管理员可移除管理员。")]
+            if target in admins:
+                admins.remove(target)
+                self.runtime_config["admin_ids"] = admins
+                self._save_json(self.runtime_config_path, self.runtime_config)
+            return [event.plain_result(f"已移除管理员：{target}")]
+
+        if action in {"特殊定价", "setprice"}:
+            if len(args) < 3:
+                return [event.plain_result("用法：/方舟盲盒 管理员 特殊定价 <种类ID> <金额>")]
+            if current_user not in admins:
+                return [event.plain_result("仅管理员可设置特殊盒价格。")]
+
+            category_id = args[1]
+            if category_id not in self.config:
+                return [event.plain_result(f"不存在种类 `{category_id}`")]
+            if not args[2].isdigit() or int(args[2]) < 0:
+                return [event.plain_result("金额必须为非负整数。")]
+
+            category = self.config[category_id]
+            if category.get("box_type", "number") != "special":
+                return [event.plain_result("该种类不是特殊盒（box_type=special），无需设置特殊定价。")]
+
+            special_prices = self.runtime_config.get("special_box_prices", {})
+            special_prices[category_id] = int(args[2])
+            self.runtime_config["special_box_prices"] = special_prices
+            self._save_json(self.runtime_config_path, self.runtime_config)
+            return [event.plain_result(f"已设置特殊盒 {category_id} 单抽价格：{args[2]} 元")]
+
+        return [event.plain_result("未知管理员指令。")]
 
     def _extract_command_args(self, raw_message: str) -> List[str]:
         text = (raw_message or "").strip()
@@ -221,11 +349,14 @@ class ArknightsBlindBoxPlugin(Star):
     def _build_help_text(self) -> str:
         return (
             "明日方舟通行证盲盒指令：\n"
-            "1) /方舟盲盒 列表\n"
-            "2) /方舟盲盒 选择 <种类ID>\n"
-            "3) /方舟盲盒 开 <序号>\n"
-            "4) /方舟盲盒 状态 [种类ID]\n"
-            "5) /方舟盲盒 刷新 [种类ID]"
+            "1) /方舟盲盒 注册\n"
+            "2) /方舟盲盒 钱包\n"
+            "3) /方舟盲盒 列表\n"
+            "4) /方舟盲盒 选择 <种类ID>\n"
+            "5) /方舟盲盒 开 <序号>\n"
+            "6) /方舟盲盒 状态 [种类ID]\n"
+            "7) /方舟盲盒 刷新 [种类ID]\n"
+            "8) /方舟盲盒 管理员 ...（列表/添加/移除/特殊定价）"
         )
 
     def _build_category_list_text(self) -> str:
@@ -234,9 +365,11 @@ class ArknightsBlindBoxPlugin(Star):
 
         lines = ["可用盲盒种类："]
         for category_id, category in self.config.items():
+            box_type = category.get("box_type", "number")
             lines.append(
                 f"- {category_id}: {category.get('name', category_id)}"
-                f"（卡池: {len(self.pool_state.get(category_id, []))}/{len(category.get('items', {}))}，"
+                f"（类型: {box_type}，价格: {self._get_category_price(category_id)} 元，"
+                f"卡池: {len(self.pool_state.get(category_id, []))}/{len(category.get('items', {}))}，"
                 f"序号: {len(self.slot_state.get(category_id, []))}/{int(category.get('slots', 0))}）"
             )
         lines.append("\n使用：/方舟盲盒 选择 <种类ID>")
@@ -246,6 +379,26 @@ class ArknightsBlindBoxPlugin(Star):
         room = str(getattr(event, "group_id", "") or getattr(event, "session_id", "") or "private")
         user = str(getattr(event, "user_id", "") or getattr(event, "sender_id", "") or "unknown")
         return f"{room}:{user}"
+
+    def _build_wallet_key(self, event: AstrMessageEvent) -> str:
+        return str(getattr(event, "user_id", "") or getattr(event, "sender_id", "") or "unknown")
+
+    def _is_admin(self, event: AstrMessageEvent) -> bool:
+        return self._build_wallet_key(event) in self._get_admin_ids()
+
+    def _get_admin_ids(self) -> List[str]:
+        return [str(v) for v in self.runtime_config.get("admin_ids", [])]
+
+    def _get_category_price(self, category_id: str) -> int:
+        category = self.config.get(category_id, {})
+        box_type = category.get("box_type", "number")
+        if box_type == "number":
+            return int(self.runtime_config.get("number_box_price", 25))
+
+        special_prices = self.runtime_config.get("special_box_prices", {})
+        if category_id in special_prices:
+            return int(special_prices[category_id])
+        return int(category.get("price", self.runtime_config.get("special_box_default_price", 40)))
 
     def _build_results_with_optional_image(self, event: AstrMessageEvent, text: str, image: str):
         image = (image or "").strip()
@@ -276,6 +429,11 @@ class ArknightsBlindBoxPlugin(Star):
         self.pool_state = self._load_json(self.state_path, default={})
         self.slot_state = self._load_json(self.slot_state_path, default={})
         self.sessions = self._load_json(self.session_path, default={})
+        self.wallets = self._load_json(self.wallet_path, default={})
+        self.runtime_config = self._load_json(self.runtime_config_path, default={})
+
+        self._runtime_config_mtime = self._safe_mtime(self.runtime_config_path)
+        self._box_config_mtime = self._safe_mtime(self.config_path)
 
     def _ensure_states_initialized(self):
         changed_pool = False
@@ -294,12 +452,70 @@ class ArknightsBlindBoxPlugin(Star):
         if changed_slot:
             self._save_json(self.slot_state_path, self.slot_state)
 
+    def _maybe_reload_runtime_data(self):
+        runtime_mtime = self._safe_mtime(self.runtime_config_path)
+        box_mtime = self._safe_mtime(self.config_path)
+        if runtime_mtime > self._runtime_config_mtime:
+            self.runtime_config = self._load_json(self.runtime_config_path, default=self.runtime_config)
+            self._runtime_config_mtime = runtime_mtime
+            logger.info("[arknights_blindbox] 已自动重载 runtime_config.json")
+
+        if box_mtime > self._box_config_mtime:
+            self.config = self._load_json(self.config_path, default=self.config)
+            self._ensure_states_initialized()
+            self._box_config_mtime = box_mtime
+            logger.info("[arknights_blindbox] 已自动重载 box_config.json")
+
+    def _sync_runtime_config_from_context(self):
+        now = time.time()
+        if now - self._last_context_sync < 3:
+            return
+        self._last_context_sync = now
+
+        get_conf = getattr(self.context, "get_config", None)
+        if not callable(get_conf):
+            return
+
+        try:
+            conf = get_conf()
+        except Exception as ex:
+            logger.warning(f"[arknights_blindbox] 读取 WebUI 配置失败：{ex}")
+            return
+
+        if not isinstance(conf, dict) or not conf:
+            return
+
+        merged = dict(self.runtime_config)
+        for key in ["initial_balance", "number_box_price", "special_box_default_price", "admin_ids", "special_box_prices"]:
+            if key in conf:
+                merged[key] = conf[key]
+
+        if merged != self.runtime_config:
+            self.runtime_config = merged
+            self._save_json(self.runtime_config_path, self.runtime_config)
+            logger.info("[arknights_blindbox] 已同步并保存 WebUI 插件配置")
+
+    def _ensure_default_runtime_config(self):
+        if self.runtime_config_path.exists():
+            return
+        self._save_json(
+            self.runtime_config_path,
+            {
+                "initial_balance": 200,
+                "number_box_price": 25,
+                "special_box_default_price": 40,
+                "admin_ids": [],
+                "special_box_prices": {}
+            }
+        )
+
     def _ensure_default_config(self):
         if self.config_path.exists():
             return
         default_config = {
-            "vc17": {
-                "name": "2024音律联觉通行证盲盒",
+            "num_vc17": {
+                "name": "2024音律联觉通行证盲盒（数字盒）",
+                "box_type": "number",
                 "slots": 14,
                 "selection_image": "https://example.com/ak-vc17-selection.jpg",
                 "items": {
@@ -308,8 +524,10 @@ class ArknightsBlindBoxPlugin(Star):
                     "vc17-03": {"name": "缪尔赛思 通行证卡套", "image": "https://example.com/ak-vc17-03.jpg"}
                 }
             },
-            "anniv": {
-                "name": "周年系列通行证盲盒",
+            "sp_anniv": {
+                "name": "周年系列通行证盲盒（特殊盒）",
+                "box_type": "special",
+                "price": 68,
                 "slots": 12,
                 "selection_image": "https://example.com/ak-anniv-selection.jpg",
                 "items": {
@@ -319,6 +537,9 @@ class ArknightsBlindBoxPlugin(Star):
             }
         }
         self._save_json(self.config_path, default_config)
+
+    def _safe_mtime(self, path: Path) -> float:
+        return path.stat().st_mtime if path.exists() else 0
 
     def _load_json(self, path: Path, default):
         if not path.exists():
@@ -339,4 +560,6 @@ class ArknightsBlindBoxPlugin(Star):
         self._save_json(self.state_path, self.pool_state)
         self._save_json(self.slot_state_path, self.slot_state)
         self._save_json(self.session_path, self.sessions)
+        self._save_json(self.wallet_path, self.wallets)
+        self._save_json(self.runtime_config_path, self.runtime_config)
         logger.info("[arknights_blindbox] 插件已卸载，状态已保存。")
