@@ -91,3 +91,9 @@
 
 
 若仍提示“无法识别账号ID”，请在 NapCat 适配器下确认事件包含 `sender/user_id` 字段；本版本已增强多字段兼容识别。
+
+
+## 持久化说明
+
+- 本版本开始，插件数据默认优先存放在独立持久化目录（优先 `/opt/AstrBot/data/plugin_data/astrbot_plugin_arknights_authorization`），避免插件热重载/卸载时因代码目录变更导致数据丢失。
+- 升级后会自动尝试把旧 `data/` 目录中的历史数据迁移到持久化目录。
