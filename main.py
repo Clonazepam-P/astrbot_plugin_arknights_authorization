@@ -3,6 +3,7 @@ import random
 import sqlite3
 import time
 from pathlib import Path
+import shutil
 from typing import Dict, List, Optional, Tuple
 
 from astrbot.api import logger
@@ -10,14 +11,15 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 
-@register("astrbot_plugin_arknights_authorization", "codex", "明日方舟通行证盲盒互动插件", "1.3.1")
+@register("astrbot_plugin_arknights_authorization", "codex", "明日方舟通行证盲盒互动插件", "1.3.2")
 class ArknightsBlindBoxPlugin(Star):
     """明日方舟通行证盲盒互动插件。"""
 
     def __init__(self, context: Context):
         super().__init__(context)
         self.base_dir = Path(__file__).resolve().parent
-        self.data_dir = self.base_dir / "data"
+        self.legacy_data_dir = self.base_dir / "data"
+        self.data_dir = self._resolve_persistent_data_dir()
         self.config_path = self.data_dir / "box_config.json"
         self.state_path = self.data_dir / "pool_state.json"
         self.slot_state_path = self.data_dir / "slot_state.json"
@@ -37,6 +39,7 @@ class ArknightsBlindBoxPlugin(Star):
 
     async def initialize(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_data_if_needed()
         self._ensure_default_config()
         self._ensure_default_runtime_config()
         self._load_all()
@@ -649,6 +652,52 @@ class ArknightsBlindBoxPlugin(Star):
             },
         }
         self._save_json(self.config_path, default_config)
+
+    def _resolve_persistent_data_dir(self) -> Path:
+        """选择重载/卸载后仍可保留的数据目录。"""
+        # 优先使用 AstrBot context 暴露的数据目录
+        for getter_name in ("get_data_dir", "get_plugin_data_dir", "get_storage_dir"):
+            getter = getattr(self.context, getter_name, None)
+            if callable(getter):
+                try:
+                    value = getter()
+                    if value:
+                        return Path(value) / "astrbot_plugin_arknights_authorization"
+                except Exception:
+                    pass
+
+        # 常见 AstrBot 部署目录：/opt/AstrBot/data
+        astrbot_data = Path("/opt/AstrBot/data")
+        if astrbot_data.exists():
+            return astrbot_data / "plugin_data" / "astrbot_plugin_arknights_authorization"
+
+        # 兜底：用户 HOME 下目录（避免跟随插件代码目录被重建）
+        return Path.home() / ".astrbot" / "plugin_data" / "astrbot_plugin_arknights_authorization"
+
+    def _migrate_legacy_data_if_needed(self):
+        """首次升级时把旧 data 目录的数据迁移到持久目录。"""
+        if not self.legacy_data_dir.exists() or self.legacy_data_dir.resolve() == self.data_dir.resolve():
+            return
+
+        migrated_any = False
+        for file_name in [
+            "box_config.json",
+            "pool_state.json",
+            "slot_state.json",
+            "sessions.json",
+            "runtime_config.json",
+            "blindbox.db",
+            "wallets.json",
+        ]:
+            src = self.legacy_data_dir / file_name
+            dst = self.data_dir / file_name
+            if src.exists() and not dst.exists():
+                self.data_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                migrated_any = True
+
+        if migrated_any:
+            logger.info("[arknights_blindbox] 已将旧 data 目录数据迁移到持久化目录。")
 
     def _init_db(self):
         conn = sqlite3.connect(self.db_path)
