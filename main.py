@@ -220,6 +220,7 @@ class ArknightsBlindBoxPlugin(Star):
                 f"奖品名称：{item_name}\n"
                 f"当前卡池剩余：{remain_pool}\n"
                 f"当前可选序号数：{remain_slots}/{slots}\n"
+                f"当前可选序号：{self._format_available_slots(category_id)}\n"
                 f"本次花费：{price} 元，当前余额：{new_balance} 元\n"
                 f"当前群：{group_id}"
             )
