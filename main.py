@@ -64,11 +64,10 @@ class ArknightsBlindBoxPlugin(Star):
                 f"你已选择【{category.get('name', category_id)}】\n"
                 f"当前剩余奖品数：{remain_count}\n"
                 f"可选盲盒序号：1 ~ {slots}\n"
-                "请发送指令：/方舟盲盒 开 <序号>"
+                "请发送：/方舟盲盒 开 <序号>"
             )
             image = category.get("selection_image", "")
-            for result in self._build_results_with_optional_image(event, tip_text, image):
-                yield result
+            yield self._event_result_with_optional_image(event, tip_text, image)
             return
 
         if action in {"开", "开启", "open"}:
@@ -116,12 +115,10 @@ class ArknightsBlindBoxPlugin(Star):
 
             msg = (
                 f"你选择了第 {box_no} 号盲盒，开启结果：\n"
-                f"所属种类：{category.get('name', category_id)}\n"
-                f"奖品名称：{item_name}\n"
+                f"🎉 {item_name}\n"
                 f"当前奖池剩余：{remain_count}{reset_tip}"
             )
-            for result in self._build_results_with_optional_image(event, msg, item_image):
-                yield result
+            yield self._event_result_with_optional_image(event, msg, item_image)
             return
 
         if action in {"状态", "status"}:
@@ -188,14 +185,16 @@ class ArknightsBlindBoxPlugin(Star):
         user = str(getattr(event, "user_id", "") or getattr(event, "sender_id", "") or "unknown")
         return f"{room}:{user}"
 
-    def _build_results_with_optional_image(self, event: AstrMessageEvent, text: str, image: str):
+    def _event_result_with_optional_image(self, event: AstrMessageEvent, text: str, image: str):
         image = (image or "").strip()
         if image and hasattr(event, "image_result"):
-            # 为兼容不同适配器，图片与文字分开发送，确保文字说明不会丢失。
-            return [event.image_result(image), event.plain_result(text)]
+            try:
+                return event.image_result(image, text)
+            except TypeError:
+                return event.image_result(image)
         if image:
-            return [event.plain_result(f"{text}\n图片：{image}")]
-        return [event.plain_result(text)]
+            return event.plain_result(f"{text}\n图片：{image}")
+        return event.plain_result(text)
 
     def _load_all(self):
         self.config = self._load_json(self.config_path, default={})
