@@ -1,3 +1,4 @@
+import asyncio
 import json
 import random
 import re
@@ -12,7 +13,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 
-@register("astrbot_plugin_arknights_authorization", "codex", "明日方舟通行证盲盒互动插件", "1.4.8")
+@register("astrbot_plugin_arknights_authorization", "codex", "明日方舟通行证盲盒互动插件", "1.5.0")
 class ArknightsBlindBoxPlugin(Star):
     """明日方舟通行证盲盒互动插件。"""
 
@@ -38,6 +39,7 @@ class ArknightsBlindBoxPlugin(Star):
 
         self._runtime_config_mtime: float = 0
         self._last_context_sync: float = 0
+        self._daily_gift_task: Optional[asyncio.Task] = None
 
     async def initialize(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -46,13 +48,16 @@ class ArknightsBlindBoxPlugin(Star):
         self._load_all()
         self._sync_runtime_config_from_context()
         self._init_db()
+        self._grant_daily_gift_if_due()
         self._refresh_categories_and_states()
+        self._daily_gift_task = asyncio.create_task(self._daily_gift_loop())
         logger.info("[arknights_blindbox] 插件初始化完成。")
 
     @filter.command("方舟盲盒")
     async def arknights_blindbox(self, event: AstrMessageEvent):
         self._maybe_reload_runtime_data()
         self._sync_runtime_config_from_context()
+        self._grant_daily_gift_if_due()
         self._refresh_categories_and_states()
 
         args = self._extract_command_args(event.message_str)
@@ -254,7 +259,7 @@ class ArknightsBlindBoxPlugin(Star):
 
     def _handle_admin_command(self, event: AstrMessageEvent, args: List[str]):
         if not args:
-            return [event.plain_result("管理员指令：列表/添加 <user_id>/移除 <user_id>/特殊定价 <种类ID> <金额>")]
+            return [event.plain_result("管理员指令：列表/添加 <user_id>/移除 <user_id>/特殊定价 <种类ID> <金额>/余额 <user_id> <金额> [group_id]")]
 
         identity = self._get_identity(event)
         if identity is None:
@@ -308,7 +313,24 @@ class ArknightsBlindBoxPlugin(Star):
             self._save_json(self.runtime_config_path, self.runtime_config)
             return [event.plain_result(f"已设置特殊盒 {category_id} 价格：{amount} 元")]
 
+        if action in {"余额", "setbalance"}:
+            if len(args) < 3:
+                return [event.plain_result("用法：/方舟盲盒 管理员 余额 <user_id> <金额> [group_id]")]
+            if current_user_id not in admins:
+                return [event.plain_result("仅管理员可设置用户余额。")]
+            if not bool(self.runtime_config.get("admin_balance_set_enabled", True)):
+                return [event.plain_result("WebUI 已关闭管理员余额设置功能。")]
+            target_user_id, amount = args[1], args[2]
+            target_group_id = args[3] if len(args) > 3 else identity[0]
+            if not amount.isdigit() or int(amount) < 0:
+                return [event.plain_result("金额必须是非负整数。")]
+            if self._db_get_user(target_group_id, target_user_id) is None:
+                return [event.plain_result(f"用户 {target_user_id} 在群 {target_group_id} 未注册。")]
+            self._db_update_balance(target_group_id, target_user_id, int(amount))
+            return [event.plain_result(f"已设置余额：群 {target_group_id} 用户 {target_user_id} = {amount} 元")]
+
         return [event.plain_result("未知管理员指令。")]
+
 
     def _extract_command_args(self, raw_message: str) -> List[str]:
         text = (raw_message or "").strip()
@@ -329,7 +351,7 @@ class ArknightsBlindBoxPlugin(Star):
             "6) /方舟盲盒 状态 [种类ID]\n"
             "7) /方舟盲盒 刷新 [种类ID]\n"
             "8) /方舟盲盒 重载资源\n"
-            "9) /方舟盲盒 管理员 ..."
+            "9) /方舟盲盒 管理员 ...（含余额设置）"
         )
 
     def _build_category_list_text(self) -> str:
@@ -464,7 +486,7 @@ class ArknightsBlindBoxPlugin(Star):
             return
 
         merged = dict(self.runtime_config)
-        for key in ["initial_balance", "number_box_price", "special_box_default_price", "admin_ids", "special_box_prices"]:
+        for key in ["initial_balance", "number_box_price", "special_box_default_price", "admin_ids", "special_box_prices", "daily_gift_amount", "admin_balance_set_enabled"]:
             if key in conf:
                 merged[key] = conf[key]
         if merged != self.runtime_config:
@@ -545,6 +567,8 @@ class ArknightsBlindBoxPlugin(Star):
             "special_box_default_price": 40,
             "admin_ids": [],
             "special_box_prices": {},
+            "daily_gift_amount": 100,
+            "admin_balance_set_enabled": True,
         })
 
 
@@ -618,6 +642,14 @@ class ArknightsBlindBoxPlugin(Star):
                     remaining_items TEXT NOT NULL,
                     remaining_slots TEXT NOT NULL,
                     updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS system_kv (
+                    k TEXT PRIMARY KEY,
+                    v TEXT NOT NULL
                 )
                 """
             )
@@ -707,6 +739,60 @@ class ArknightsBlindBoxPlugin(Star):
     def _db_reset_category_state(self, category_id: str, category: dict):
         self._db_set_category_state(category_id, list(category["items"].keys()), list(category["slots"]))
 
+    def _utc8_date_hour(self) -> Tuple[str, int]:
+        ts = time.time() + 8 * 3600
+        t = time.gmtime(ts)
+        return time.strftime("%Y-%m-%d", t), t.tm_hour
+
+    def _db_get_kv(self, key: str) -> Optional[str]:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cur = conn.execute("SELECT v FROM system_kv WHERE k=?", (key,))
+            row = cur.fetchone()
+            return str(row[0]) if row else None
+        finally:
+            conn.close()
+
+    def _db_set_kv(self, key: str, value: str):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("INSERT OR REPLACE INTO system_kv(k,v) VALUES (?,?)", (key, str(value)))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _db_grant_daily_gift(self, amount: int) -> int:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cur = conn.execute("UPDATE user_wallet SET balance = balance + ?", (int(amount),))
+            conn.commit()
+            return int(cur.rowcount or 0)
+        finally:
+            conn.close()
+
+    def _grant_daily_gift_if_due(self) -> bool:
+        amount = int(self.runtime_config.get("daily_gift_amount", 100))
+        if amount <= 0:
+            return False
+        current_date, current_hour = self._utc8_date_hour()
+        if current_hour < 6:
+            return False
+        last_date = self._db_get_kv("last_daily_gift_date")
+        if last_date == current_date:
+            return False
+        affected = self._db_grant_daily_gift(amount)
+        self._db_set_kv("last_daily_gift_date", current_date)
+        logger.info(f"[arknights_blindbox] 每日赠送已发放：日期={current_date} 金额={amount} 覆盖用户数={affected}")
+        return True
+
+    async def _daily_gift_loop(self):
+        while True:
+            try:
+                self._grant_daily_gift_if_due()
+            except Exception as ex:
+                logger.warning(f"[arknights_blindbox] 每日赠送任务异常：{ex}")
+            await asyncio.sleep(60)
+
     def _load_json(self, path: Path, default):
         if not path.exists():
             return default
@@ -726,6 +812,9 @@ class ArknightsBlindBoxPlugin(Star):
         return path.stat().st_mtime if path.exists() else 0
 
     async def terminate(self):
+        if self._daily_gift_task:
+            self._daily_gift_task.cancel()
+            self._daily_gift_task = None
         self._save_json(self.session_path, self.sessions)
         self._save_json(self.runtime_config_path, self.runtime_config)
         logger.info("[arknights_blindbox] 插件已卸载，状态已保存。")
