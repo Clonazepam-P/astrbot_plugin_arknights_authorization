@@ -83,3 +83,6 @@ resources/number_box/
 - `db_service.py`：SQLite 读写与状态持久化
 - `resource_service.py`：资源扫描、奖品解析、签名构建
 - `time_service.py`：时间工具（UTC+8 日期/小时）
+
+
+- 冷却机制：同一用户在同一群组开完一发后需等待 10 秒才能继续开启。

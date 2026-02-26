@@ -54,7 +54,7 @@ except ImportError:
     from time_service import utc8_date_hour
 
 
-@register("astrbot_plugin_arknights_authorization", "codex", "明日方舟通行证盲盒互动插件", "1.5.2")
+@register("astrbot_plugin_arknights_authorization", "codex", "明日方舟通行证盲盒互动插件", "1.5.3")
 class ArknightsBlindBoxPlugin(Star):
     """明日方舟通行证盲盒互动插件。"""
 
@@ -81,6 +81,8 @@ class ArknightsBlindBoxPlugin(Star):
         self._runtime_config_mtime: float = 0
         self._last_context_sync: float = 0
         self._daily_gift_task: Optional[asyncio.Task] = None
+        self._open_cooldown_seconds: int = 10
+        self._last_open_ts: Dict[str, float] = {}
 
     async def initialize(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -182,7 +184,6 @@ class ArknightsBlindBoxPlugin(Star):
                 yield event.plain_result(
                     f"你已选择【{category['id']}】\n"
                     f"当前卡池剩余：{len(remain_items)}\n"
-                    f"当前可选序号数：{len(remain_slots)}/{category['slot_total']}\n"
                     f"当前单抽价格：{price} 元\n"
                     "该种类已不可继续开启。你可以：\n"
                     f"1) /方舟盲盒 刷新 {category_id}\n"
@@ -193,7 +194,6 @@ class ArknightsBlindBoxPlugin(Star):
             tip = (
                 f"你已选择【{category['id']}】\n"
                 f"当前卡池剩余：{len(remain_items)}\n"
-                f"当前可选序号数：{len(remain_slots)}/{category['slot_total']}\n"
                 f"当前单抽价格：{price} 元\n"
                 f"可选序号：{self._format_slots(remain_slots)}\n"
                 "请发送指令：/方舟盲盒 开 <序号>"
@@ -235,11 +235,20 @@ class ArknightsBlindBoxPlugin(Star):
                 yield event.plain_result(f"余额不足，当前余额：{balance} 元，当前单抽价格：{price} 元")
                 return
 
+            cooldown_key = f"{group_id}:{user_id}"
+            now_ts = time.time()
+            last_ts = self._last_open_ts.get(cooldown_key, 0)
+            remain_cd = self._open_cooldown_seconds - int(now_ts - last_ts)
+            if remain_cd > 0:
+                yield event.plain_result(f"操作过快，请等待 {remain_cd} 秒后再开盲盒。")
+                return
+
             selected = random.choice(remain_items)
             remain_items.remove(selected)
             remain_slots.remove(choose_slot)
             self._db_set_category_state(category_id, remain_items, remain_slots)
             self._db_update_balance(group_id, user_id, balance - price)
+            self._last_open_ts[cooldown_key] = now_ts
 
             item = category["items"][selected]
             prize_image = item.get("image")
@@ -248,7 +257,6 @@ class ArknightsBlindBoxPlugin(Star):
                 f"所属种类：{category['id']}\n"
                 f"奖品名称：{item['name']}\n"
                 f"当前卡池剩余：{len(remain_items)}\n"
-                f"当前可选序号数：{len(remain_slots)}/{category['slot_total']}\n"
                 f"当前可选序号：{self._format_slots(remain_slots)}\n"
                 f"本次花费：{price} 元，当前余额：{self._db_get_balance(group_id, user_id)} 元\n"
                 f"当前群：{group_id}"
